@@ -1,12 +1,40 @@
-const http = require("http");
+const express = require("express");
 
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("Michiverse server online");
+const app = express();
+app.use(express.json());
+
+const users = {};
+
+app.post("/register", (req, res) => {
+    const { username, password } = req.body;
+
+    if (users[username]) {
+        return res.status(400).json({ error: "User exists" });
+    }
+
+    users[username] = {
+        password: password
+    };
+
+    res.json({ ok: true });
+});
+
+app.post("/login", (req, res) => {
+    const { username, password } = req.body;
+
+    if (!users[username]) {
+        return res.status(404).json({ error: "No user" });
+    }
+
+    if (users[username].password !== password) {
+        return res.status(401).json({ error: "Wrong password" });
+    }
+
+    res.json({ ok: true, user: username });
 });
 
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-    console.log("Michiverse server running on port " + PORT);
+app.listen(PORT, () => {
+    console.log("Michiverse auth running on " + PORT);
 });
