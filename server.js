@@ -38,15 +38,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log("Michiverse running on " + PORT);
 });
-    if (user.password !== password) {
-        return res.status(401).json({ error: "Wrong password" });
-    }
-
-    res.json({ ok: true, user: username });
-});
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-    console.log("Michiverse running on " + PORT);
-});
