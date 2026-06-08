@@ -1,13 +1,12 @@
-import express from "express";
+const http = require("http");
 
-const app = express();
-
-app.get("/", (req, res) => {
-    res.send("Michiverse server online");
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Michiverse server online");
 });
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log("Michiverse server running on port " + PORT);
 });
