@@ -96,6 +96,27 @@ app.get("/users/:id", (req, res) => {
     return res.json({ ok: true, user: getPublicUser(users[index]) });
 });
 
+app.get("/username-exists/:username", (req, res) => {
+    try {
+        const username = String(req.params.username || "").trim();
+
+        if (!username) {
+            return res.status(400).json({ error: "Falta username" });
+        }
+
+        const users = readUsers();
+        const exists = findUserIndexByUsername(users, username) !== -1;
+
+        return res.json({
+            ok: true,
+            exists: exists
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: "Error del servidor" });
+    }
+});
+
 app.post("/register", async (req, res) => {
     try {
         const username = String(req.body.username || "").trim();
