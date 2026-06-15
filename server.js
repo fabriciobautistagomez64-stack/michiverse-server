@@ -5,45 +5,120 @@ const bcrypt = require("bcrypt");
 const crypto = require("crypto");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "64kb" }));
 
 const DATA_DIR = path.join(__dirname, "data");
 const DB_FILE = path.join(DATA_DIR, "users.json");
+const TMP_FILE = path.join(DATA_DIR, "users.json.tmp");
 
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
 if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify([], null, 2));
-}
-
-function readUsers() {
-    const raw = fs.readFileSync(DB_FILE, "utf8");
-    return JSON.parse(raw);
-}
-
-function saveUsers(users) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
+    fs.writeFileSync(DB_FILE, JSON.stringify([], null, 2), "utf8");
 }
 
 function now() {
     return Date.now();
 }
 
+function readUsersFromDisk() {
+    try {
+        const raw = fs.readFileSync(DB_FILE, "utf8");
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+            return [];
+        }
+        return parsed.map(normalizeUser).filter(Boolean);
+    } catch {
+        return [];
+    }
+}
+
+function normalizeUser(user) {
+    if (!user || typeof user !== "object") {
+        return null;
+    }
+
+    return {
+        id: String(user.id || ""),
+        username: String(user.username || "Guest"),
+        passwordHash: String(user.passwordHash || ""),
+        coins: Number.isFinite(Number(user.coins)) ? Number(user.coins) : 0,
+        inventory: Array.isArray(user.inventory) ? user.inventory : [],
+        friends: Array.isArray(user.friends) ? user.friends.map(String) : [],
+        lastPing: typeof user.lastPing === "number" ? user.lastPing : 0,
+        isPlaying: !!user.isPlaying
+    };
+}
+
+let usersCache = readUsersFromDisk();
+
+let saveTimer = null;
+let dirty = false;
+
+function queueSave() {
+    dirty = true;
+
+    if (saveTimer) {
+        return;
+    }
+
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        flushSave();
+    }, 250);
+}
+
+function flushSave() {
+    if (!dirty) {
+        return;
+    }
+
+    const payload = JSON.stringify(usersCache, null, 2);
+
+    try {
+        fs.writeFileSync(TMP_FILE, payload, "utf8");
+        fs.renameSync(TMP_FILE, DB_FILE);
+        dirty = false;
+    } catch (err) {
+        console.error(err);
+    }
+}
+
+setInterval(() => {
+    flushSave();
+}, 5000);
+
+process.on("SIGINT", () => {
+    flushSave();
+    process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+    flushSave();
+    process.exit(0);
+});
+
 function isOnline(user) {
     return typeof user.lastPing === "number" && (now() - user.lastPing) < 10000;
 }
 
 function getPublicUser(user) {
+    const normalized = normalizeUser(user);
+    if (!normalized) {
+        return null;
+    }
+
     return {
-        id: user.id,
-        username: user.username,
-        coins: user.coins,
-        inventory: user.inventory,
-        friends: user.friends,
-        isPlaying: user.isPlaying,
-        online: isOnline(user)
+        id: normalized.id,
+        username: normalized.username,
+        coins: normalized.coins,
+        inventory: normalized.inventory,
+        friends: normalized.friends,
+        isPlaying: normalized.isPlaying,
+        online: isOnline(normalized)
     };
 }
 
@@ -64,7 +139,8 @@ function findUserIndexById(users, id) {
 }
 
 function findUserIndexByUsername(users, username) {
-    return users.findIndex(user => user.username.toLowerCase() === String(username).toLowerCase());
+    const target = String(username || "").toLowerCase();
+    return users.findIndex(user => String(user.username || "").toLowerCase() === target);
 }
 
 function log(message, value = "") {
@@ -80,20 +156,18 @@ app.get("/", (req, res) => {
 });
 
 app.get("/users", (req, res) => {
-    const users = readUsers();
-    const publicUsers = users.map(getPublicUser);
+    const publicUsers = usersCache.map(getPublicUser).filter(Boolean);
     return res.json({ ok: true, users: publicUsers });
 });
 
 app.get("/users/:id", (req, res) => {
-    const users = readUsers();
-    const index = findUserIndexById(users, req.params.id);
+    const index = findUserIndexById(usersCache, req.params.id);
 
     if (index === -1) {
         return res.status(404).json({ error: "Usuario no encontrado" });
     }
 
-    return res.json({ ok: true, user: getPublicUser(users[index]) });
+    return res.json({ ok: true, user: getPublicUser(usersCache[index]) });
 });
 
 app.get("/username-exists/:username", (req, res) => {
@@ -104,12 +178,11 @@ app.get("/username-exists/:username", (req, res) => {
             return res.status(400).json({ error: "Falta username" });
         }
 
-        const users = readUsers();
-        const exists = findUserIndexByUsername(users, username) !== -1;
+        const exists = findUserIndexByUsername(usersCache, username) !== -1;
 
         return res.json({
             ok: true,
-            exists: exists
+            exists
         });
     } catch (err) {
         console.error(err);
@@ -126,17 +199,23 @@ app.post("/register", async (req, res) => {
             return res.status(400).json({ error: "Faltan datos" });
         }
 
-        const users = readUsers();
-        const exists = findUserIndexByUsername(users, username) !== -1;
+        if (username.length < 3) {
+            return res.status(400).json({ error: "Username muy corto" });
+        }
 
+        if (password.length < 6) {
+            return res.status(400).json({ error: "Contraseña muy corta" });
+        }
+
+        const exists = findUserIndexByUsername(usersCache, username) !== -1;
         if (exists) {
             return res.status(409).json({ error: "Ese nombre ya existe" });
         }
 
         const passwordHash = await bcrypt.hash(password, 10);
-        const id = generateUniqueId(users);
+        const id = generateUniqueId(usersCache);
 
-        const newUser = {
+        const newUser = normalizeUser({
             id,
             username,
             passwordHash,
@@ -145,10 +224,10 @@ app.post("/register", async (req, res) => {
             friends: [],
             lastPing: now(),
             isPlaying: false
-        };
+        });
 
-        users.push(newUser);
-        saveUsers(users);
+        usersCache.push(newUser);
+        queueSave();
 
         log("User registered", `${username} (${id})`);
 
@@ -171,14 +250,13 @@ app.post("/login", async (req, res) => {
             return res.status(400).json({ error: "Faltan datos" });
         }
 
-        const users = readUsers();
-        const index = findUserIndexByUsername(users, username);
+        const index = findUserIndexByUsername(usersCache, username);
 
         if (index === -1) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        const user = users[index];
+        const user = usersCache[index];
         const ok = await bcrypt.compare(password, user.passwordHash);
 
         if (!ok) {
@@ -186,7 +264,7 @@ app.post("/login", async (req, res) => {
         }
 
         user.lastPing = now();
-        saveUsers(users);
+        queueSave();
 
         log("User logged", `${user.username} (${user.id})`);
 
@@ -208,18 +286,17 @@ app.post("/logout", (req, res) => {
             return res.status(400).json({ error: "Falta userId" });
         }
 
-        const users = readUsers();
-        const index = findUserIndexById(users, userId);
+        const index = findUserIndexById(usersCache, userId);
 
         if (index === -1) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        users[index].lastPing = 0;
-        users[index].isPlaying = false;
-        saveUsers(users);
+        usersCache[index].lastPing = 0;
+        usersCache[index].isPlaying = false;
+        queueSave();
 
-        log("User logged out", `${users[index].username} (${users[index].id})`);
+        log("User logged out", `${usersCache[index].username} (${usersCache[index].id})`);
 
         return res.json({ ok: true });
     } catch (err) {
@@ -237,21 +314,19 @@ app.post("/ping", (req, res) => {
             return res.status(400).json({ error: "Falta userId" });
         }
 
-        const users = readUsers();
-        const index = findUserIndexById(users, userId);
+        const index = findUserIndexById(usersCache, userId);
 
         if (index === -1) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        users[index].lastPing = now();
-        users[index].isPlaying = isPlaying;
-        saveUsers(users);
+        usersCache[index].lastPing = now();
+        usersCache[index].isPlaying = isPlaying;
 
         return res.json({
             ok: true,
             online: true,
-            isPlaying: users[index].isPlaying
+            isPlaying: usersCache[index].isPlaying
         });
     } catch (err) {
         console.error(err);
@@ -261,14 +336,13 @@ app.post("/ping", (req, res) => {
 
 app.get("/presence/:id", (req, res) => {
     try {
-        const users = readUsers();
-        const index = findUserIndexById(users, req.params.id);
+        const index = findUserIndexById(usersCache, req.params.id);
 
         if (index === -1) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        const user = users[index];
+        const user = usersCache[index];
 
         return res.json({
             ok: true,
@@ -297,30 +371,29 @@ app.post("/friends/add", (req, res) => {
             return res.status(400).json({ error: "No te puedes agregar a ti mismo" });
         }
 
-        const users = readUsers();
-        const userIndex = findUserIndexById(users, userId);
-        const friendIndex = findUserIndexById(users, friendId);
+        const userIndex = findUserIndexById(usersCache, userId);
+        const friendIndex = findUserIndexById(usersCache, friendId);
 
         if (userIndex === -1 || friendIndex === -1) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        if (!users[userIndex].friends.includes(friendId)) {
-            users[userIndex].friends.push(friendId);
+        if (!usersCache[userIndex].friends.includes(friendId)) {
+            usersCache[userIndex].friends.push(friendId);
         }
 
-        if (!users[friendIndex].friends.includes(userId)) {
-            users[friendIndex].friends.push(userId);
+        if (!usersCache[friendIndex].friends.includes(userId)) {
+            usersCache[friendIndex].friends.push(userId);
         }
 
-        saveUsers(users);
+        queueSave();
 
-        log("Friend added", `${users[userIndex].username} <-> ${users[friendIndex].username}`);
+        log("Friend added", `${usersCache[userIndex].username} <-> ${usersCache[friendIndex].username}`);
 
         return res.json({
             ok: true,
-            user: getPublicUser(users[userIndex]),
-            friend: getPublicUser(users[friendIndex])
+            user: getPublicUser(usersCache[userIndex]),
+            friend: getPublicUser(usersCache[friendIndex])
         });
     } catch (err) {
         console.error(err);
@@ -337,25 +410,24 @@ app.post("/friends/remove", (req, res) => {
             return res.status(400).json({ error: "Faltan datos" });
         }
 
-        const users = readUsers();
-        const userIndex = findUserIndexById(users, userId);
-        const friendIndex = findUserIndexById(users, friendId);
+        const userIndex = findUserIndexById(usersCache, userId);
+        const friendIndex = findUserIndexById(usersCache, friendId);
 
         if (userIndex === -1 || friendIndex === -1) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        users[userIndex].friends = users[userIndex].friends.filter(id => id !== friendId);
-        users[friendIndex].friends = users[friendIndex].friends.filter(id => id !== userId);
+        usersCache[userIndex].friends = usersCache[userIndex].friends.filter(id => id !== friendId);
+        usersCache[friendIndex].friends = usersCache[friendIndex].friends.filter(id => id !== userId);
 
-        saveUsers(users);
+        queueSave();
 
-        log("Friend removed", `${users[userIndex].username} <-> ${users[friendIndex].username}`);
+        log("Friend removed", `${usersCache[userIndex].username} <-> ${usersCache[friendIndex].username}`);
 
         return res.json({
             ok: true,
-            user: getPublicUser(users[userIndex]),
-            friend: getPublicUser(users[friendIndex])
+            user: getPublicUser(usersCache[userIndex]),
+            friend: getPublicUser(usersCache[friendIndex])
         });
     } catch (err) {
         console.error(err);
@@ -365,16 +437,13 @@ app.post("/friends/remove", (req, res) => {
 
 app.get("/online", (req, res) => {
     try {
-        const users = readUsers();
-        const onlineUsers = users.filter(isOnline).map(getPublicUser);
+        const onlineUsers = usersCache.filter(isOnline).map(getPublicUser).filter(Boolean);
         return res.json({ ok: true, users: onlineUsers });
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: "Error del servidor" });
     }
 });
-
-const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
     log("Michiverse server running on " + PORT);
