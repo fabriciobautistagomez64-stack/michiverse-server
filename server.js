@@ -9,7 +9,7 @@ const app = express();
 app.use(express.json({ limit: "64kb" }));
 
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || "postgresql://michiverse_cuentas_postgres_user:Bb0cHwkv1omhBFEV5kSfxNDgWGxPZgMe@dpg-d8s62isvikkc7399nc60-a/michiverse_cuentas_postgres",
+    connectionString: process.env.DATABASE_URL || "postgresql://neondb_owner:npg_UzQZV4fhEyO3@ep-raspy-haze-adnlrydh-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
     ssl: { rejectUnauthorized: false }
 });
 
