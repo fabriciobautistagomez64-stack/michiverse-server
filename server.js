@@ -1,113 +1,50 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
+const { Pool } = require("pg");
+
 const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.json({ limit: "64kb" }));
 
-const DATA_DIR = path.join(__dirname, "data");
-const DB_FILE = path.join(DATA_DIR, "users.json");
-const TMP_FILE = path.join(DATA_DIR, "users.json.tmp");
-
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify([], null, 2), "utf8");
-}
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || "postgresql://michiverse_cuentas_postgres_user:Bb0cHwkv1omhBFEV5kSfxNDgWGxPZgMe@dpg-d8s62isvikkc7399nc60-a/michiverse_cuentas_postgres",
+    ssl: { rejectUnauthorized: false }
+});
 
 function now() {
     return Date.now();
 }
 
-function readUsersFromDisk() {
-    try {
-        const raw = fs.readFileSync(DB_FILE, "utf8");
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) {
-            return [];
-        }
-        return parsed.map(normalizeUser).filter(Boolean);
-    } catch {
-        return [];
-    }
+function generateUniqueId() {
+    return String(crypto.randomInt(100000000, 999999999));
 }
-
-function normalizeUser(user) {
-    if (!user || typeof user !== "object") {
-        return null;
-    }
-
-    return {
-        id: String(user.id || ""),
-        username: String(user.username || "Guest"),
-        passwordHash: String(user.passwordHash || ""),
-        coins: Number.isFinite(Number(user.coins)) ? Number(user.coins) : 0,
-        inventory: Array.isArray(user.inventory) ? user.inventory : [],
-        friends: Array.isArray(user.friends) ? user.friends.map(String) : [],
-        lastPing: typeof user.lastPing === "number" ? user.lastPing : 0,
-        isPlaying: !!user.isPlaying
-    };
-}
-
-let usersCache = readUsersFromDisk();
-
-let saveTimer = null;
-let dirty = false;
-
-function queueSave() {
-    dirty = true;
-
-    if (saveTimer) {
-        return;
-    }
-
-    saveTimer = setTimeout(() => {
-        saveTimer = null;
-        flushSave();
-    }, 250);
-}
-
-function flushSave() {
-    if (!dirty) {
-        return;
-    }
-
-    const payload = JSON.stringify(usersCache, null, 2);
-
-    try {
-        fs.writeFileSync(TMP_FILE, payload, "utf8");
-        fs.renameSync(TMP_FILE, DB_FILE);
-        dirty = false;
-    } catch (err) {
-        console.error(err);
-    }
-}
-
-setInterval(() => {
-    flushSave();
-}, 5000);
-
-process.on("SIGINT", () => {
-    flushSave();
-    process.exit(0);
-});
-
-process.on("SIGTERM", () => {
-    flushSave();
-    process.exit(0);
-});
 
 function isOnline(user) {
     return typeof user.lastPing === "number" && (now() - user.lastPing) < 10000;
 }
 
+function rowToUser(row) {
+    if (!row) {
+        return null;
+    }
+
+    return {
+        id: String(row.id || ""),
+        username: String(row.username || "Guest"),
+        passwordHash: String(row.password_hash || ""),
+        coins: Number.isFinite(Number(row.coins)) ? Number(row.coins) : 0,
+        inventory: Array.isArray(row.inventory) ? row.inventory : [],
+        friends: Array.isArray(row.friends) ? row.friends.map(String) : [],
+        lastPing: row.last_ping ? new Date(row.last_ping).getTime() : 0,
+        isPlaying: !!row.is_playing
+    };
+}
+
 function getPublicUser(user) {
-    const normalized = normalizeUser(user);
+    const normalized = rowToUser(user);
+
     if (!normalized) {
         return null;
     }
@@ -123,55 +60,66 @@ function getPublicUser(user) {
     };
 }
 
-function generateUniqueId(users) {
-    let id = "";
-    let exists = true;
-
-    while (exists) {
-        id = String(crypto.randomInt(100000000, 999999999));
-        exists = users.some(user => user.id === id);
-    }
-
-    return id;
+async function initDb() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            coins INTEGER NOT NULL DEFAULT 0,
+            inventory JSONB NOT NULL DEFAULT '[]'::jsonb,
+            friends JSONB NOT NULL DEFAULT '[]'::jsonb,
+            last_ping TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            is_playing BOOLEAN NOT NULL DEFAULT FALSE
+        );
+    `);
 }
 
-function findUserIndexById(users, id) {
-    return users.findIndex(user => user.id === String(id));
+async function findUserByUsername(username) {
+    return pool.query(
+        `SELECT * FROM users WHERE lower(username) = lower($1) LIMIT 1`,
+        [String(username || "").trim()]
+    );
 }
 
-function findUserIndexByUsername(users, username) {
-    const target = String(username || "").toLowerCase();
-    return users.findIndex(user => String(user.username || "").toLowerCase() === target);
-}
-
-function log(message, value = "") {
-    if (value !== "") {
-        console.log(`[Michiverse] ${message}: ${value}`);
-    } else {
-        console.log(`[Michiverse] ${message}`);
-    }
+async function findUserById(id) {
+    return pool.query(
+        `SELECT * FROM users WHERE id = $1 LIMIT 1`,
+        [String(id || "").trim()]
+    );
 }
 
 app.get("/", (req, res) => {
     res.send("Michiverse server online");
 });
 
-app.get("/users", (req, res) => {
-    const publicUsers = usersCache.map(getPublicUser).filter(Boolean);
-    return res.json({ ok: true, users: publicUsers });
-});
-
-app.get("/users/:id", (req, res) => {
-    const index = findUserIndexById(usersCache, req.params.id);
-
-    if (index === -1) {
-        return res.status(404).json({ error: "Usuario no encontrado" });
+app.get("/users", async (req, res) => {
+    try {
+        const result = await pool.query(`SELECT * FROM users ORDER BY username ASC`);
+        const publicUsers = result.rows.map(getPublicUser).filter(Boolean);
+        return res.json({ ok: true, users: publicUsers });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: "Error del servidor" });
     }
-
-    return res.json({ ok: true, user: getPublicUser(usersCache[index]) });
 });
 
-app.get("/username-exists/:username", (req, res) => {
+app.get("/users/:id", async (req, res) => {
+    try {
+        const result = await findUserById(req.params.id);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Usuario no encontrado" });
+        }
+
+        return res.json({ ok: true, user: getPublicUser(result.rows[0]) });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: "Error del servidor" });
+    }
+});
+
+app.get("/username-exists/:username", async (req, res) => {
     try {
         const username = String(req.params.username || "").trim();
 
@@ -179,11 +127,11 @@ app.get("/username-exists/:username", (req, res) => {
             return res.status(400).json({ error: "Falta username" });
         }
 
-        const exists = findUserIndexByUsername(usersCache, username) !== -1;
+        const result = await findUserByUsername(username);
 
         return res.json({
             ok: true,
-            exists
+            exists: result.rows.length > 0
         });
     } catch (err) {
         console.error(err);
@@ -208,33 +156,44 @@ app.post("/register", async (req, res) => {
             return res.status(400).json({ error: "Contraseña muy corta" });
         }
 
-        const exists = findUserIndexByUsername(usersCache, username) !== -1;
-        if (exists) {
+        const exists = await findUserByUsername(username);
+        if (exists.rows.length > 0) {
             return res.status(409).json({ error: "Ese nombre ya existe" });
         }
 
         const passwordHash = await bcrypt.hash(password, 10);
-        const id = generateUniqueId(usersCache);
+        let inserted = null;
 
-        const newUser = normalizeUser({
-            id,
-            username,
-            passwordHash,
-            coins: 0,
-            inventory: [],
-            friends: [],
-            lastPing: now(),
-            isPlaying: false
-        });
+        for (let attempts = 0; attempts < 10; attempts++) {
+            const id = generateUniqueId();
 
-        usersCache.push(newUser);
-        queueSave();
+            try {
+                const result = await pool.query(
+                    `INSERT INTO users (id, username, password_hash, coins, inventory, friends, last_ping, is_playing)
+                     VALUES ($1, $2, $3, 0, '[]'::jsonb, '[]'::jsonb, NOW(), FALSE)
+                     RETURNING *`,
+                    [id, username, passwordHash]
+                );
 
-        log("User registered", `${username} (${id})`);
+                inserted = result.rows[0];
+                break;
+            } catch (err) {
+                if (err && err.code === "23505") {
+                    continue;
+                }
+                throw err;
+            }
+        }
+
+        if (!inserted) {
+            return res.status(500).json({ error: "No se pudo crear el usuario" });
+        }
+
+        log("User registered", `${username} (${inserted.id})`);
 
         return res.json({
             ok: true,
-            user: getPublicUser(newUser)
+            user: getPublicUser(inserted)
         });
     } catch (err) {
         console.error(err);
@@ -251,27 +210,32 @@ app.post("/login", async (req, res) => {
             return res.status(400).json({ error: "Faltan datos" });
         }
 
-        const index = findUserIndexByUsername(usersCache, username);
+        const result = await findUserByUsername(username);
 
-        if (index === -1) {
+        if (result.rows.length === 0) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        const user = usersCache[index];
-        const ok = await bcrypt.compare(password, user.passwordHash);
+        const user = result.rows[0];
+        const ok = await bcrypt.compare(password, user.password_hash);
 
         if (!ok) {
             return res.status(401).json({ error: "Contraseña incorrecta" });
         }
 
-        user.lastPing = now();
-        queueSave();
+        const updated = await pool.query(
+            `UPDATE users
+             SET last_ping = NOW()
+             WHERE id = $1
+             RETURNING *`,
+            [user.id]
+        );
 
         log("User logged", `${user.username} (${user.id})`);
 
         return res.json({
             ok: true,
-            user: getPublicUser(user)
+            user: getPublicUser(updated.rows[0])
         });
     } catch (err) {
         console.error(err);
@@ -279,7 +243,7 @@ app.post("/login", async (req, res) => {
     }
 });
 
-app.post("/logout", (req, res) => {
+app.post("/logout", async (req, res) => {
     try {
         const userId = String(req.body.userId || "").trim();
 
@@ -287,17 +251,20 @@ app.post("/logout", (req, res) => {
             return res.status(400).json({ error: "Falta userId" });
         }
 
-        const index = findUserIndexById(usersCache, userId);
+        const result = await findUserById(userId);
 
-        if (index === -1) {
+        if (result.rows.length === 0) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        usersCache[index].lastPing = 0;
-        usersCache[index].isPlaying = false;
-        queueSave();
+        await pool.query(
+            `UPDATE users
+             SET last_ping = to_timestamp(0), is_playing = FALSE
+             WHERE id = $1`,
+            [userId]
+        );
 
-        log("User logged out", `${usersCache[index].username} (${usersCache[index].id})`);
+        log("User logged out", `${result.rows[0].username} (${userId})`);
 
         return res.json({ ok: true });
     } catch (err) {
@@ -306,7 +273,7 @@ app.post("/logout", (req, res) => {
     }
 });
 
-app.post("/ping", (req, res) => {
+app.post("/ping", async (req, res) => {
     try {
         const userId = String(req.body.userId || "").trim();
         const isPlaying = !!req.body.isPlaying;
@@ -315,19 +282,24 @@ app.post("/ping", (req, res) => {
             return res.status(400).json({ error: "Falta userId" });
         }
 
-        const index = findUserIndexById(usersCache, userId);
+        const result = await findUserById(userId);
 
-        if (index === -1) {
+        if (result.rows.length === 0) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        usersCache[index].lastPing = now();
-        usersCache[index].isPlaying = isPlaying;
+        const updated = await pool.query(
+            `UPDATE users
+             SET last_ping = NOW(), is_playing = $2
+             WHERE id = $1
+             RETURNING *`,
+            [userId, isPlaying]
+        );
 
         return res.json({
             ok: true,
             online: true,
-            isPlaying: usersCache[index].isPlaying
+            isPlaying: updated.rows[0].is_playing
         });
     } catch (err) {
         console.error(err);
@@ -335,15 +307,15 @@ app.post("/ping", (req, res) => {
     }
 });
 
-app.get("/presence/:id", (req, res) => {
+app.get("/presence/:id", async (req, res) => {
     try {
-        const index = findUserIndexById(usersCache, req.params.id);
+        const result = await findUserById(req.params.id);
 
-        if (index === -1) {
+        if (result.rows.length === 0) {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        const user = usersCache[index];
+        const user = rowToUser(result.rows[0]);
 
         return res.json({
             ok: true,
@@ -359,7 +331,9 @@ app.get("/presence/:id", (req, res) => {
     }
 });
 
-app.post("/friends/add", (req, res) => {
+app.post("/friends/add", async (req, res) => {
+    const client = await pool.connect();
+
     try {
         const userId = String(req.body.userId || "").trim();
         const friendId = String(req.body.friendId || "").trim();
@@ -372,37 +346,60 @@ app.post("/friends/add", (req, res) => {
             return res.status(400).json({ error: "No te puedes agregar a ti mismo" });
         }
 
-        const userIndex = findUserIndexById(usersCache, userId);
-        const friendIndex = findUserIndexById(usersCache, friendId);
+        await client.query("BEGIN");
 
-        if (userIndex === -1 || friendIndex === -1) {
+        const userResult = await client.query(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [userId]);
+        const friendResult = await client.query(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [friendId]);
+
+        if (userResult.rows.length === 0 || friendResult.rows.length === 0) {
+            await client.query("ROLLBACK");
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        if (!usersCache[userIndex].friends.includes(friendId)) {
-            usersCache[userIndex].friends.push(friendId);
+        const user = rowToUser(userResult.rows[0]);
+        const friend = rowToUser(friendResult.rows[0]);
+
+        if (!user.friends.includes(friendId)) {
+            user.friends.push(friendId);
         }
 
-        if (!usersCache[friendIndex].friends.includes(userId)) {
-            usersCache[friendIndex].friends.push(userId);
+        if (!friend.friends.includes(userId)) {
+            friend.friends.push(userId);
         }
 
-        queueSave();
+        const updatedUser = await client.query(
+            `UPDATE users SET friends = $1::jsonb WHERE id = $2 RETURNING *`,
+            [JSON.stringify(user.friends), userId]
+        );
 
-        log("Friend added", `${usersCache[userIndex].username} <-> ${usersCache[friendIndex].username}`);
+        const updatedFriend = await client.query(
+            `UPDATE users SET friends = $1::jsonb WHERE id = $2 RETURNING *`,
+            [JSON.stringify(friend.friends), friendId]
+        );
+
+        await client.query("COMMIT");
+
+        log("Friend added", `${user.username} <-> ${friend.username}`);
 
         return res.json({
             ok: true,
-            user: getPublicUser(usersCache[userIndex]),
-            friend: getPublicUser(usersCache[friendIndex])
+            user: getPublicUser(updatedUser.rows[0]),
+            friend: getPublicUser(updatedFriend.rows[0])
         });
     } catch (err) {
+        try {
+            await client.query("ROLLBACK");
+        } catch {}
         console.error(err);
         return res.status(500).json({ error: "Error del servidor" });
+    } finally {
+        client.release();
     }
 });
 
-app.post("/friends/remove", (req, res) => {
+app.post("/friends/remove", async (req, res) => {
+    const client = await pool.connect();
+
     try {
         const userId = String(req.body.userId || "").trim();
         const friendId = String(req.body.friendId || "").trim();
@@ -411,34 +408,56 @@ app.post("/friends/remove", (req, res) => {
             return res.status(400).json({ error: "Faltan datos" });
         }
 
-        const userIndex = findUserIndexById(usersCache, userId);
-        const friendIndex = findUserIndexById(usersCache, friendId);
+        await client.query("BEGIN");
 
-        if (userIndex === -1 || friendIndex === -1) {
+        const userResult = await client.query(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [userId]);
+        const friendResult = await client.query(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [friendId]);
+
+        if (userResult.rows.length === 0 || friendResult.rows.length === 0) {
+            await client.query("ROLLBACK");
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        usersCache[userIndex].friends = usersCache[userIndex].friends.filter(id => id !== friendId);
-        usersCache[friendIndex].friends = usersCache[friendIndex].friends.filter(id => id !== userId);
+        const user = rowToUser(userResult.rows[0]);
+        const friend = rowToUser(friendResult.rows[0]);
 
-        queueSave();
+        user.friends = user.friends.filter(id => id !== friendId);
+        friend.friends = friend.friends.filter(id => id !== userId);
 
-        log("Friend removed", `${usersCache[userIndex].username} <-> ${usersCache[friendIndex].username}`);
+        const updatedUser = await client.query(
+            `UPDATE users SET friends = $1::jsonb WHERE id = $2 RETURNING *`,
+            [JSON.stringify(user.friends), userId]
+        );
+
+        const updatedFriend = await client.query(
+            `UPDATE users SET friends = $1::jsonb WHERE id = $2 RETURNING *`,
+            [JSON.stringify(friend.friends), friendId]
+        );
+
+        await client.query("COMMIT");
+
+        log("Friend removed", `${user.username} <-> ${friend.username}`);
 
         return res.json({
             ok: true,
-            user: getPublicUser(usersCache[userIndex]),
-            friend: getPublicUser(usersCache[friendIndex])
+            user: getPublicUser(updatedUser.rows[0]),
+            friend: getPublicUser(updatedFriend.rows[0])
         });
     } catch (err) {
+        try {
+            await client.query("ROLLBACK");
+        } catch {}
         console.error(err);
         return res.status(500).json({ error: "Error del servidor" });
+    } finally {
+        client.release();
     }
 });
 
-app.get("/online", (req, res) => {
+app.get("/online", async (req, res) => {
     try {
-        const onlineUsers = usersCache.filter(isOnline).map(getPublicUser).filter(Boolean);
+        const result = await pool.query(`SELECT * FROM users ORDER BY username ASC`);
+        const onlineUsers = result.rows.map(rowToUser).filter(isOnline).map(getPublicUser).filter(Boolean);
         return res.json({ ok: true, users: onlineUsers });
     } catch (err) {
         console.error(err);
@@ -446,6 +465,41 @@ app.get("/online", (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
-    log("Michiverse server running on " + PORT);
+function log(message, value = "") {
+    if (value !== "") {
+        console.log(`[Michiverse] ${message}: ${value}`);
+    } else {
+        console.log(`[Michiverse] ${message}`);
+    }
+}
+
+async function start() {
+    try {
+        await initDb();
+
+        app.listen(PORT, () => {
+            log("Michiverse server running on " + PORT);
+        });
+    } catch (err) {
+        console.error(err);
+        process.exit(1);
+    }
+}
+
+process.on("SIGINT", async () => {
+    try {
+        await pool.end();
+    } finally {
+        process.exit(0);
+    }
 });
+
+process.on("SIGTERM", async () => {
+    try {
+        await pool.end();
+    } finally {
+        process.exit(0);
+    }
+});
+
+start();
